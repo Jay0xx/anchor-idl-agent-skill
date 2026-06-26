@@ -1,4 +1,10 @@
+import { createHash } from 'node:crypto'
+import { AnchorProvider, Idl, Program } from '@coral-xyz/anchor'
+import { Connection, PublicKey } from '@solana/web3.js'
+
 const BPF_UPGRADEABLE_LOADER = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111')
+
+export interface SourceLocation { file: string; line: number; column?: number }
 
 export interface LoadIdlOptions {
   programId: string
@@ -16,6 +22,8 @@ export interface LoadIdlOptions {
 }
 
 export interface LoadedIdl {
+  /** Map of Anchor error code -> first source location declared via `x-source`. */
+  errorSourceMap?: Record<number, SourceLocation>
   idl: Idl
   sha256: string
   source: LoadIdlOptions['source']
@@ -120,5 +128,9 @@ export async function loadIdl(opts: LoadIdlOptions): Promise<LoadedIdl> {
     )
   }
 
-  return { idl, sha256, source: opts.source, programId: opts.programId, upgradeAuthority, lastUpgradeSlot }
+  const errorSourceMap: Record<number, SourceLocation> = {}
+  const errs = (idl as Idl & { errors?: Array<{ code: number; sources?: SourceLocation[] }> }).errors
+  if (errs) for (const e of errs) if (e.sources && e.sources[0]) errorSourceMap[e.code] = e.sources[0]
+
+  return { idl, sha256, source: opts.source, programId: opts.programId, upgradeAuthority, lastUpgradeSlot, errorSourceMap }
 }
