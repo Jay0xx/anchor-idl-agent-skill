@@ -8,6 +8,11 @@ export interface ResolvedAccounts {
 const SYSVAR_MAP: Record<string, PublicKey> = {
   rent: SYSVAR_RENT_PUBKEY,
   clock: SYSVAR_CLOCK_PUBKEY,
+  instructions: SYSVAR_INSTRUCTIONS_PUBKEY,
+  epochSchedule: SYSVAR_EPOCH_SCHEDULE_PUBKEY,
+  slotHashes: SYSVAR_SLOT_HASHES_PUBKEY,
+  slotHistory: SYSVAR_SLOT_HISTORY_PUBKEY,
+  stakeHistory: SYSVAR_STAKE_HISTORY_PUBKEY,
 }
 const PROGRAM_MAP: Record<string, PublicKey> = {
   systemProgram: SystemProgram.programId,

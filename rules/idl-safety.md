@@ -1,24 +1,28 @@
----
-name: idl-safety
-description: Hard rules that apply whenever the anchor-idl-agent skill is producing or sending a transaction.
-globs: ["**/anchor-*.ts", "**/idl-*.ts", "**/tx-*.ts", "**/*.idl.json"]
----
+# IDL Safety Rules (must be followed by the agent)
 
-# IDL Safety Rule
+1. **Never use an IDL without one of:**
+   - `expectedSha256` pinned in the `loadIdl` call, OR
+   - explicit user confirmation that this is an exploratory / read-only use.
 
-This rule applies to any code that builds, simulates, or sends Solana transactions derived from an Anchor IDL.
+2. **For any tx that moves value, also pin `expectedUpgradeAuthority`.**
+   A silent upgrade with a changed authority MUST fail loudly.
 
-## Must
+3. **Allowlist is mandatory by default.** Bypass requires
+   `unsafe.allowNonAllowlisted = true` with a human-readable `reason`.
+   The bypass is logged.
 
-- Always call `simulateTransaction` before `sendTransaction`. If sim returns non-null `err`, decode it and stop. **No exceptions.**
-- Always use the `resolveAccounts` helper for account resolution; never hand-derive PDAs in adapter code.
-- Always verify the IDL's account discriminator matches an on-chain account of that type before trusting an off-chain IDL.
-- Always include `ComputeBudgetProgram.setComputeUnitLimit` and `setComputeUnitPrice` sized from the simulation result.
-- Always check the program ID against `ALLOWLIST` in `skill/safety-rails.md` and prompt for explicit confirmation if not present.
+4. **Allowlist hash pinning:** when adding a program, prefer setting
+   `idlSha256` to the audited hash rather than `'*'`. Wildcard entries
+   are legacy and should be migrated.
 
-## Must not
+5. **Multi-instruction transactions:** every programId in the bundle is
+   checked. Do not split a logically-atomic flow across separate
+   transactions to dodge an allowlist failure.
 
-- Do not call `sendTransaction` with `skipPreflight: true` unless a simulation has just succeeded in the same code path with the same blockhash.
-- Do not retry failed sends automatically — surface the signature, decoded error, and let the user decide.
-- Do not cache IDLs by program ID alone; always include the IDL sha256.
-- Do not bypass the safety rails with `{ unsafe: ... }` without logging the override and the reason.
+6. **Decoder output is advisory.** The decoder reports the innermost
+   `AnchorError`. Treat the framework code table as a starting point, not
+   ground truth — always consult the program's IDL `errors` array when
+   available.
+
+7. **Simulation does not guarantee success.** Always refresh blockhash and
+   re-simulate if the user delays signing.

@@ -1,122 +1,132 @@
-import type { Signer } from '@solana/web3.js'
-import type { Idl } from '@coral-xyz/anchor'
+import type { LoadedIdl } from './ingest.js'
+
+export interface SimulateOptions {
+  provider: AnchorProvider
+  /** One or more instructions executed atomically. */
+  instructions: TransactionInstruction[]
+  payer: PublicKey
+  /** Address lookup tables, for versioned tx that wouldn't otherwise fit. */
+  addressLookupTableAccounts?: AddressLookupTableAccount[]
+  /** Loaded IDLs keyed by programId, used for decoding + allowlist hash check. */
+  loadedIdls?: Record<string, LoadedIdl>
+  signers?: Signer[]
+  /** Override compute unit limit (default: estimated by simulation). */
+  computeUnitLimit?: number
+  priorityFeeMicroLamports?: number
+  /** If true, skip allowlist (dangerous — caller must justify). */
+  unsafe?: { allowNonAllowlisted?: boolean; reason?: string }
+}
 
 export interface SimulationResult {
-  unitsConsumed: number
-  priorityFeeMicroLamports: number
-  totalFeeLamports: number
-  accountWrites: Array<{ address: string; before: unknown; after: unknown }>
-  returnData?: { type: string; value: unknown }
-  logs: string[]
-}
-
-export interface SendResult {
   ok: boolean
-  signature?: string
-  explorerUrl?: string
-  simulation: SimulationResult
-  error?: DecodedAnchorError
+  computeUnitsConsumed?: number
+  totalFeeLamports?: number
+  logs: string[]
+  error?: DecodedAnchorError | { raw: unknown }
+  tx: VersionedTransaction
+  blockhash: string
+  lastValidBlockHeight: number
 }
 
-export interface SimulateAndSendOpts {
-  simulateOnly?: boolean
-  confirm?: 'auto' | 'interactive'
-  idl?: Idl
-  unsafe?: { allowNonAllowlisted?: boolean; allowCuOverCap?: boolean }
+async function withRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
+  let last: unknown
+  for (let i = 0; i <= retries; i++) {
+    try { return await fn() } catch (e) { last = e; await new Promise(r => setTimeout(r, 300 * (i + 1))) }
+  }
+  throw last instanceof Error ? last : new Error(String(last))
 }
 
-export async function simulateAndSend(
-  connection: Connection,
-  tx: VersionedTransaction,
-  signers: Signer[],
-  opts: SimulateAndSendOpts = {},
-): Promise<SendResult> {
-  // --- Safety: allowlist check ---
-  const programId = tx.message.staticAccountKeys[tx.message.compiledInstructions[0]?.programIdIndex ?? 0]?.toBase58()
-  if (programId && !ALLOWLIST.has(programId) && !opts.unsafe?.allowNonAllowlisted) {
-    throw new Error(`SafetyRailViolation: program ${programId} not in allowlist`)
+function buildTx(
+  payer: PublicKey, ixs: TransactionInstruction[], blockhash: string,
+  alts: AddressLookupTableAccount[],
+): VersionedTransaction {
+  const msg = new TransactionMessage({ payerKey: payer, recentBlockhash: blockhash, instructions: ixs })
+    .compileToV0Message(alts)
+  return new VersionedTransaction(msg)
+}
+
+export async function simulate(opts: SimulateOptions): Promise<SimulationResult> {
+  if (opts.instructions.length > SAFETY_RAILS.maxInstructionsPerTx) {
+    throw new Error(`Too many instructions: ${opts.instructions.length} > ${SAFETY_RAILS.maxInstructionsPerTx}`)
   }
 
-  // --- Simulate ---
-  const sim = await connection.simulateTransaction(tx, {
-    sigVerify: false,
-    replaceRecentBlockhash: true,
-    commitment: 'processed',
-  })
+  const programIds = programIdsOfIxs(opts.instructions)
+  const hashes: Record<string, string> = {}
+  for (const [pid, l] of Object.entries(opts.loadedIdls ?? {})) hashes[pid] = l.sha256
+  const allow = checkAllowlist(programIds, hashes)
+  if (!allow.ok) {
+    if (!opts.unsafe?.allowNonAllowlisted) {
+      throw new Error('Allowlist violations: ' + JSON.stringify(allow.violations))
+    }
+    console.warn('[anchor-skill] ALLOWLIST BYPASSED:', JSON.stringify(allow.violations),
+                 'reason:', opts.unsafe.reason ?? '(none provided)')
+  }
+
+  const conn: Connection = opts.provider.connection
+  const alts = opts.addressLookupTableAccounts ?? []
+
+  // Wrap with compute-budget instructions if requested.
+  const ixs = [...opts.instructions]
+  if (opts.computeUnitLimit) {
+    if (opts.computeUnitLimit > SAFETY_RAILS.maxComputeUnits)
+      throw new Error('computeUnitLimit exceeds maxComputeUnits')
+    ixs.unshift(ComputeBudgetProgram.setComputeUnitLimit({ units: opts.computeUnitLimit }))
+  }
+  if (opts.priorityFeeMicroLamports) {
+    if (opts.priorityFeeMicroLamports > SAFETY_RAILS.maxPriorityMicroLamports)
+      throw new Error('priorityFee exceeds maxPriorityMicroLamports')
+    ixs.unshift(ComputeBudgetProgram.setComputeUnitPrice({
+      microLamports: opts.priorityFeeMicroLamports,
+    }))
+  }
+
+  const latest = await withRetry(() => conn.getLatestBlockhash('confirmed'))
+  const tx = buildTx(opts.payer, ixs, latest.blockhash, alts)
+  if (opts.signers?.length) tx.sign(opts.signers)
+
+  const sim = await withRetry(() => conn.simulateTransaction(tx, {
+    sigVerify: false, replaceRecentBlockhash: true, commitment: 'confirmed',
+  }))
+  const logs = sim.value.logs ?? []
+  const cu = sim.value.unitsConsumed
+
+  let fee: number | undefined
+  try {
+    const f = await conn.getFeeForMessage(tx.message, 'confirmed')
+    fee = f.value ?? undefined
+    if (fee !== undefined && fee / 1e9 > SAFETY_RAILS.maxTotalFeeSol)
+      throw new Error(`Estimated fee ${fee} lamports exceeds maxTotalFeeSol`)
+  } catch { /* fee estimation is best-effort */ }
 
   if (sim.value.err) {
-    const error = opts.idl
-      ? decodeAnchorError(extractErrorCode(sim.value.err), opts.idl, sim.value.logs ?? [])
-      : { kind: 'unknown' as const, code: -1 }
+    const decoded = decodeAnchorError(logs, { idls: Object.fromEntries(
+      Object.entries(opts.loadedIdls ?? {}).map(([k, v]) => [k, v.idl])
+    ) })
     return {
-      ok: false,
-      simulation: emptySim(sim.value.logs ?? []),
-      error,
+      ok: false, computeUnitsConsumed: cu ?? undefined, totalFeeLamports: fee,
+      logs, error: decoded ?? { raw: sim.value.err }, tx,
+      blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight,
     }
   }
-
-  const unitsConsumed = sim.value.unitsConsumed ?? 200_000
-  if (unitsConsumed > SAFETY_RAILS.maxComputeUnits && !opts.unsafe?.allowCuOverCap) {
-    throw new Error(`SafetyRailViolation: simulated CU ${unitsConsumed} > cap ${SAFETY_RAILS.maxComputeUnits}`)
-  }
-
-  const simulation: SimulationResult = {
-    unitsConsumed,
-    priorityFeeMicroLamports: 0,  // populated after fee fetch
-    totalFeeLamports: 0,
-    accountWrites: [],
-    logs: sim.value.logs ?? [],
-  }
-
-  if (opts.simulateOnly) {
-    return { ok: true, simulation }
-  }
-
-  // --- Send ---
-  tx.sign(signers)
-  const sig = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 0 })
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash()
-  const result = await connection.confirmTransaction(
-    { signature: sig, blockhash, lastValidBlockHeight },
-    'confirmed',
-  )
-
-  if (result.value.err) {
-    const error = opts.idl
-      ? decodeAnchorError(extractErrorCode(result.value.err), opts.idl, simulation.logs)
-      : { kind: 'unknown' as const, code: -1 }
-    return { ok: false, signature: sig, simulation, error }
-  }
-
   return {
-    ok: true,
-    signature: sig,
-    explorerUrl: `https://solscan.io/tx/${sig}`,
-    simulation,
+    ok: true, computeUnitsConsumed: cu ?? undefined, totalFeeLamports: fee,
+    logs, tx, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight,
   }
 }
 
-function emptySim(logs: string[]): SimulationResult {
-  return { unitsConsumed: 0, priorityFeeMicroLamports: 0, totalFeeLamports: 0, accountWrites: [], logs }
+/**
+ * Send a previously-simulated tx, refreshing the blockhash first so it
+ * doesn't expire between simulation and submission.
+ */
+export async function sendSimulated(
+  conn: Connection, tx: VersionedTransaction, signers: Signer[],
+): Promise<string> {
+  const latest = await withRetry(() => conn.getLatestBlockhash('confirmed'))
+  tx.message.recentBlockhash = latest.blockhash
+  tx.sign(signers)
+  const sig = await conn.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 })
+  await conn.confirmTransaction({
+    signature: sig, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight,
+  }, 'confirmed')
+  return sig
 }
-
-function extractErrorCode(err: unknown): number {
-  // Solana errors are tagged unions; extract InstructionError(_, Custom(code))
-  if (typeof err === 'object' && err !== null && 'InstructionError' in err) {
-    const ie = (err as { InstructionError: [number, unknown] }).InstructionError[1]
-    if (typeof ie === 'object' && ie !== null && 'Custom' in ie) {
-      return (ie as { Custom: number }).Custom
-    }
-  }
-  return -1
-}
-
-// Utility kept exported for adapters that want to build budget ixns themselves.
-export function computeBudgetIxs(units: number, priorityMicroLamports: number) {
-  return [
-    ComputeBudgetProgram.setComputeUnitLimit({ units }),
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityMicroLamports }),
-  ]
-}
-
-export { TransactionMessage }
