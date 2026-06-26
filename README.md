@@ -80,3 +80,27 @@ This places the skill at `~/.claude/skills/anchor-idl-agent/` and appends routin
 ## License
 
 MIT © 2026 — built for the [Superteam Brasil Solana AI Kit bounty](https://superteam.fun/earn/listing/skills).
+
+## Safety usage notes
+
+When calling `loadIdl`, pin both the IDL hash and upgrade authority for any
+programId you treat as trusted:
+
+```ts
+const idl = await loadIdl({
+  programId,
+  source: 'onchain',
+  provider,
+  expectedSha256: '<pinned hash>',
+  expectedUpgradeAuthority: '<pinned authority or null for immutable>',
+})
+```
+
+`simulate()` allowlist-checks **every** programId in the bundle. To bypass,
+you must pass `unsafe: { allowNonAllowlisted: true, reason: '...' }` — the
+bypass is logged.
+
+## Limitations
+
+See [LIMITATIONS.md](./LIMITATIONS.md) for the full list of trust
+assumptions, data-source risks, and out-of-scope functionality.
