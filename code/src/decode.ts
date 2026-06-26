@@ -1,3 +1,7 @@
+import { AnchorProvider, Idl } from '@coral-xyz/anchor'
+import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js'
+import { loadIdl, LoadedIdl, SourceLocation } from './ingest.js'
+
 /** Anchor's full framework error table (0x1770 .. 0x17ff range etc).
  *  Source: https://github.com/coral-xyz/anchor/blob/master/lang/src/error.rs */
 export const ANCHOR_FRAMEWORK_ERRORS: Record<number, { name: string; msg: string }> = {
@@ -57,11 +61,15 @@ export interface DecodedAnchorError {
   instructionIndex?: number
   failedAccount?: string
   raw: string
+  /** Source location of the error declaration in the program crate, if available. */
+  source?: SourceLocation
 }
 
 export interface DecodeContext {
   /** programId -> idl. Used to enrich errors with custom error names. */
   idls?: Record<string, Idl>
+  /** programId -> error code -> source location. */
+  sourceMaps?: Record<string, Record<number, SourceLocation>>
   /** Last failing instruction index from `InstructionError`, if you parsed it. */
   instructionIndex?: number
   /** Resolved programId for that instruction. */
@@ -84,6 +92,7 @@ export function decodeAnchorError(logs: string[], ctx: DecodeContext = {}): Deco
   let name = 'UnknownError'
   let msg = ''
   let failedAccount: string | undefined
+  let source: SourceLocation | undefined
   if (match) {
     failedAccount = match[1]
     name = match[2] ?? name
@@ -107,6 +116,8 @@ export function decodeAnchorError(logs: string[], ctx: DecodeContext = {}): Deco
       const errs = (idl as Idl & { errors?: Array<{ code: number; name: string; msg?: string }> }).errors
       const hit = errs?.find(e => e.code === code)
       if (hit) { name = hit.name; msg = hit.msg ?? msg; origin = 'idl' }
+    const srcMap = ctx.programId && ctx.sourceMaps?.[ctx.programId]
+    if (srcMap && code !== undefined && srcMap[code]) source = srcMap[code]
     }
   }
 
@@ -115,7 +126,7 @@ export function decodeAnchorError(logs: string[], ctx: DecodeContext = {}): Deco
     code: code ?? -1,
     name, msg, origin,
     instructionIndex: ctx.instructionIndex,
-    failedAccount, raw,
+    failedAccount, raw, source,
   }
 }
 
@@ -143,14 +154,15 @@ export async function decodeFailedTx(
     programId = pk?.toBase58()
   }
   const idls: Record<string, Idl> = {}
-  for (const [pid, l] of Object.entries(opts.idls ?? {})) idls[pid] = l.idl
+  const sourceMaps: Record<string, Record<number, SourceLocation>> = {}
+  for (const [pid, l] of Object.entries(opts.idls ?? {})) { idls[pid] = l.idl; if (l.errorSourceMap) sourceMaps[pid] = l.errorSourceMap }
   if (programId && !idls[programId] && opts.provider) {
     try {
       const loaded = await loadIdl({ programId, source: 'onchain', provider: opts.provider })
       idls[programId] = loaded.idl
     } catch { /* best-effort */ }
   }
-  return decodeAnchorError(logs, { idls, instructionIndex: ixIndex, programId })
+  return decodeAnchorError(logs, { idls, sourceMaps, instructionIndex: ixIndex, programId })
 }
 
 void PublicKey
